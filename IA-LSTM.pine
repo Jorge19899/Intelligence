@@ -1,0 +1,553 @@
+//@version=5
+strategy("IA-LSTM", overlay=true)
+
+// Define input variables
+sequence_length = input(50, minval=1, title="Sequence Length")
+target_length = input(10, minval=1, title="Target Length")
+risk_per_trade = input(0.01, title="Risk Per Trade")
+atr_factor = input(2.5, title="ATR Factor")
+
+// Define technical indicators and preprocess data
+sma20 = ta.sma(close, 20)
+sma50 = ta.sma(close, 50)
+rsi = ta.rsi(close, 14)
+macd = ta.macd(close)
+cci = ta.cci(high, low, close, 20)
+ema_fast = ta.ema(close, 20)
+ema_slow = ta.ema(close, 50)
+atr = ta.atr(high, low, close)
+
+// Preprocess data
+data = ta.normalize(ta.concat(close, volume, sma20, sma50, rsi, macd, cci, ema_fast, ema_slow))
+
+// Define function to normalize data
+normalize_data(_data) =>
+    normalized = ta.normalize(_data, type=ta.normtype.MINMAX)
+    normalized
+
+// Rename variables to make them more descriptive
+sma20_values = ta.sma(history, 20)
+sma50_values = ta.sma(history, 50)
+rsi_values = ta.rsi(history, 14)
+macd_values = ta.macd(history)
+cci_values = ta.cci(history)
+
+normalized_sma20 = normalize_data(sma20_values)
+normalized_sma50 = normalize_data(sma50_values)
+normalized_rsi = normalize_data(rsi_values)
+normalized_macd = normalize_data(macd_values)
+normalized_cci = normalize_data(cci_values)
+
+data = array.join([history[:, :-1], normalized_sma20, normalized_sma50, normalized_rsi, normalized_macd, normalized_cci], axis=1)
+
+// Add target data to targets array
+targets = history[sequence_length:-target_length, -1].reshape(-1, 1)
+
+// Allow users to label data for training
+f_label_data(_data, _label, _data_type) =>
+    // Validate input
+    assert type(_label) == type.string and len(_label) <= 50, "Invalid label"
+    assert (type.isfloat(_data) or type.isstring(_data)) and array.size(_data) > 0, "Invalid data"
+
+    // Check if label already exists
+    existing_labels = array.unique(_data[:, -1])
+    assert _label not in existing_labels, "Label already exists in data"
+
+    // Add label to data
+    labeled_data = array.append(_data, _label, axis=1)
+    labeled_data
+
+// Simplify code for calculating split index
+split_index = round(array.size(history) * (1 - train_test_split_ratio))
+
+// Reassign arrays instead of copying them
+data := history[0:sequence_length + target_length]
+normalized_data := ta.normalize(data, type=ta.normtype.MINMAX)
+
+x_train := normalized_data[target_length:split_index]
+y_train := normalized_data[0:split_index]
+x_test := ta.normalize(history[split_index - sequence_length:-target_length], type=ta.normtype.MINMAX)
+y_test := history[split_index:-1]
+
+// Use array.zeros to create fold_errors array
+fold_errors = array.zeros(k)
+
+for i = 0 to k - 1
+    fold_start = i * fold_size
+    fold_end = min((i + 1) * fold_size, array.size(x_train))
+    
+    // Use array.slice to get fold data
+    x_fold = x_train[array.slice(fold_start, fold_end)]
+    y_fold = y_train[array.slice(fold_start, fold_end)]
+    x_fold_test = x_train[~array.slice(fold_start, fold_end)]
+    y_fold_test = y_train[~array.slice(fold_start, fold_end)]
+    
+    // Fit the model to the training data
+    lstm_model.fit(x_fold, y_fold, epochs=10, batch_size=32, verbose=0)
+    
+    // Evaluate the model on the test data
+    fold_errors[i] := lstm_model.evaluate(x_fold_test, y_fold_test, verbose=0)
+    
+// Use list comprehension to calculate mean error
+mean_error = [sum(fold_errors) / k][0]
+
+
+// Define function to make predictions using the LSTM model
+ml_lstm_predict(model, inputs) =>
+    predictions = model.predict(inputs)
+    return predictions
+    
+// Define the model configuration with regularization
+input_size = sequence_length + 9
+hidden_size = input(64, minval=1, title="Hidden Size")
+num_layers = input(2, minval=1, title="Number of Layers")
+learning_rate = input(0.001, minval=0, title="Learning Rate")
+num_epochs = input(100, minval=1, title="Number of Epochs")
+reg_strength = input(0.01, minval=0, title="Regularization Strength")
+reg_type = input("L2", options=["L1", "L2", "dropout"], title="Regularization Type")
+
+// Define the LSTM model with regularization
+model = ta.funeasy({
+    "L1": ml_lstm_l1,
+    "L2": ml_lstm_l2,
+    "dropout": ml_lstm_dropout
+}, data, input_size, hidden_size, target_length, sequence_length, num_layers=num_layers, learning_rate=learning_rate, num_epochs=num_epochs, l1_strength=ta.ternary(reg_type == "L1", reg_strength, 0), l2_strength=ta.ternary(reg_type == "L2", reg_strength, 0), dropout=ta.ternary(reg_type == "dropout", reg_strength, 0))
+
+// Define input and target data
+inputs = ta.sliding(data, sequence_length + 9)
+targets = close - ta.sma(close, target_length)
+
+// Use the LSTM model to make predictions
+predictions = ml_lstm_predict(model, ta.array(inputs))
+test_predictions = ta.sliding(predictions, target_length)
+
+// Split data into training and testing sets
+[train_data, test_data] = ta.split(data, 0.7)
+[train_target, test_target] = ta.split(targets, 0.7)
+
+// Implement cross-validation
+num_splits = 5
+split_indices = ta.linspace(0, len(train_data), num_splits+1, dtype=int)
+cv_scores = []
+for i = 0 to num_splits - 1
+    cv_train_data = ta.concatenate([train_data[split_indices[j]:split_indices[j+1]] for j = 0 to num_splits - 1 if j != i])
+    cv_train_target = ta.concatenate([train_target[split_indices[j]:split_indices[j+1]] for j = 0 to num_splits - 1 if j != i])
+    cv_validation_data = train_data[split_indices[i]:split_indices[i+1]]
+    cv_validation_target = train_target[split_indices[i]:split_indices[i+1]]
+
+    // Train the model with the training data
+    model.fit(ta.array(cv_train_data), ta.array(cv_train_target))
+
+    // Evaluate the model with the validation data
+    score = model.score(ta.array(cv_validation_data), ta.array(cv_validation_target))
+    cv_scores := cv_scores + [score]
+
+// Train the model with the training data
+model = model.fit(ta.array(train_data), ta.array(train_target))
+
+// Train LSTM model with early stopping
+max_epochs = input(100, title="Maximum Epochs")
+patience = input(5, title="Patience")
+min_delta = input(0.0001, title="Minimum Delta")
+batch_size = input(1, title="Batch Size")
+
+train_result = lstm.train(lstm_model, x_fold, y_fold, max_epochs=max_epochs, patience=patience, min_delta=min_delta, batch_size=batch_size)
+fold_errors[i] := ta.rmse(y_fold, lstm.predict(train_result["best_model"], x_fold))
+
+mean_error = array.mean(fold_errors)
+best_fold = array.index_of(fold_errors, array.min(fold_errors))
+best_model = lstm.train(lstm_model, array.concatenate([array.slice(x_train, 0, best_fold*fold_size), array.slice(x_train, (best_fold+1)*fold_size)]), array.concatenate([array.slice(y_train, 0, best_fold*fold_size), array.slice(y_train, (best_fold+1)*fold_size)]), max_epochs=max_epochs, patience=patience, min_delta=min_delta, batch_size=batch_size)["best_model"]
+
+best_loss = na
+wait = 0
+for i = 0 to max_epochs - 1 {
+    lstm.train_on_batch(lstm_model, x_train, y_train, batch_size=batch_size)
+    if split_index > 0 {
+        lstm_predictions = lstm.predict(lstm_model, x_test)
+        loss = ta.mean(ta.fabs(array.sub(y_test, lstm_predictions)))
+        if best_loss == na or loss < best_loss - min_delta {
+            best_loss := loss
+            wait := 0
+        } else {
+            wait := wait + 1
+        }
+        if wait >= patience {
+            break
+        }
+    }
+}
+
+normalize_prices(symbol, scaler_type="minmax", min_val=0, max_val=1, epochs=50, lookback=50) =>
+    // Verificar si el símbolo es válido
+    if not syminfo.valid_symbols(symbol)
+        throw "Símbolo inválido"
+    
+    // Obtener los datos de precios
+    priceData = security(symbol, timeframe.period, close)
+    
+    // Convertir los datos de precio en una matriz 2D
+    priceData = array.from(priceData, lookback)
+
+    // Crear el escalador apropiado
+    if scaler_type == "minmax"
+        scaler = ml_scaler_create(scaler_type)
+    else if scaler_type == "standard"
+        scaler = ml_scaler_create(scaler_type, with_mean=true, with_std=true)
+    else if scaler_type == "robust"
+        scaler = ml_scaler_create(scaler_type)
+
+    // Entrenar el escalador con los datos de precios
+    ml_scaler_fit(scaler, priceData, epochs=epochs)
+
+    // Normalizar los datos con el escalador entrenado
+    normalizedPrices = ml_scaler_transform(scaler, priceData, min_val, max_val)
+
+    // Graficar los datos normalizados
+    plot(normalizedPrices, color=color.green, title="Normalized Prices")
+    
+    // Retornar el escalador entrenado
+    return scaler
+    
+// Evaluate the model with the testing data
+test_score = model.score(ta.array(test_data), ta.array(test_target))
+
+// Print the test score
+print("Test score: ", test_score)
+
+// Make predictions with LSTM model
+lstm_predictions = lstm.predict(lstm_model, x_test)
+predicted_price = denormalize_data(array.get(lstm_predictions, 0), history)
+
+// Plot actual and predicted prices
+plot(history, title="Actual Price", color=color.blue)
+plot(array.join(array.new_float(sequence_length - 1, na), predicted_price), title="Predicted Price", color=color.green)
+
+// Define function for multi-step prediction
+multi_step_predict(lstm_model, x_test, y_test, sequence_length, num_steps, plot_results=true) => {
+    predicted_prices = array.new_float(num_steps, na)
+    x = array.copy(x_test)
+    for i = 0 to num_steps - 1 {
+        lstm_predictions = lstm.predict(lstm_model, x)
+        predicted_prices[i] = denormalize_data(array.get(lstm_predictions, 0), history)
+        x = array.copy(array.slice(x, 1))
+        x := array.push(x, array.slice(lstm_predictions, 0))
+    }
+    if plot_results {
+        plot(array.concat(array.new_float(array.size(history) - num_steps, na), predicted_prices), title="Multi-Step Predictions", color=color.green, linewidth=2)
+    }
+    rmse = math.sqrt(math.sum(math.pow(array.slice(denormalize_data(lstm_predictions, history), 0, num_steps) - array.slice(y_test, -num_steps), 2)) / num_steps)
+    rmse
+}
+
+// Verify that x_test and y_test have the same length
+if array.size(x_test) != array.size(y_test) {
+    throw "x_test and y_test have different lengths"
+}
+
+// Calculate buy/sell signals based on predictions and technical indicators
+ma200 = ta.sma(close, 200)
+prediction = test_predictions[0][-1]
+last_close = close[-1]
+last_volume = volume[-1]
+last_macd = ta.macd(close)[0][-1]
+last_cci = ta.cci(high, low, close, 20)[-1]
+atr = ta.atr(high, low, close)
+ema_fast = ta.ema(close, 20)
+ema_slow = ta.ema(close, 50)
+rsi = ta.rsi(close, 14)
+
+buy_signal = ta.and(last_close > ma200, last_macd > 0, last_cci > 0, ta.crossup(last_close, prediction), last_volume > ta.sma(volume, 20), ema_fast > ema_slow, rsi > 50, last_close > (ma200 + atr_factor * atr))
+sell_signal = ta.and(last_close < ma200, last_macd < 0, last_cci < 0, ta.crossdown(last_close, prediction), last_volume > ta.sma(volume, 20), ema_fast < ema_slow, rsi < 50, last_close < (ma200 - atr_factor * atr))
+exit_signal = abs(predictions) < 0.1
+
+// Define exit conditions
+var stop_loss = ma200 - atr_factor * atr
+var trailing_stop = 0.005
+var trailing_stop_min = 0.01
+var trailing_stop_max = 0.05
+var trailing_stop_volatility = 0.05
+
+if strategy.position_size > 0:
+    strategy.exit("Exit Long", "Buy", stop=stop_loss, trail_offset=trailing_stop, trail_offset_min=trailing_stop_min, trail_offset_max=trailing_stop_max, trail_volatility=trailing_stop_volatility)
+if strategy.position_size < 0:
+    strategy.exit("Exit Short", "Sell", stop=stop_loss, trail_offset=trailing_stop, trail_offset_min=trailing_stop_min, trail_offset_max=trailing_stop_max, trail_volatility=trailing_stop_volatility)
+    
+ // Plot the prediction
+plot(prediction)
+
+// Define trading signals based on the predictions and technical indicators
+if buy_signal
+    strategy.entry("Buy", strategy.long, size=risk_per_trade / (atr_factor * atr))
+if sell_signal
+    strategy.entry("Sell", strategy.short, size=risk_per_trade / (atr_factor * atr))
+if exit_signal
+    strategy.close_all()
+
+// Print the results
+print("Cross-validation scores: ", cv_scores)
+print("Test score: ", test_score)
+
+
+// Define function for actor-critic learning
+actor_critic_learn(lstm_model, data, target_length, learning_rate, sequence_length) => {
+    train_size = len(data) - target_length - sequence_length + 1
+    rmse_list = []
+    lstm_predictions = [0] * target_length
+    test_rmse = 0
+
+    // Define critic model
+    critic_model = lstm.build_model(sequence_length, 1)
+
+    // Define history variable
+    history = dict(
+        mean = np.mean(data),
+        std = np.std(data)
+    )
+
+    // Compile LSTM model
+    lstm_model.compile(loss='mse', optimizer='adam')
+
+    while True {
+        // Randomly sample a sequence from the training data
+        start_index = np.random.randint(train_size)
+        x_train = data[start_index + target_length:start_index + target_length + sequence_length]
+        y_train = data[start_index:start_index + target_length]
+
+        // Train LSTM model on sequence
+        lstm_model.fit(x_train, y_train, epochs=1, verbose=0)
+
+        // Calculate reward for actor
+        lstm_predictions = lstm_model.predict(x_train)
+        train_rmse = np.sqrt(np.sum(np.nan_to_num(np.power(history['mean'] + history['std'] * lstm_predictions[0] - y_train, 2))) / target_length)
+        reward = 1 / train_rmse
+
+        // Update weights for actor and critic
+        actor_gradient = reward * lstm_model.optimizer.get_gradients(lstm_model.total_loss, lstm_model.trainable_weights)[0]
+        critic_gradient = reward * critic_model.optimizer.get_gradients(critic_model.total_loss, critic_model.trainable_weights)[0]
+        lstm_model.layers[0].set_weights(lstm_model.layers[0].get_weights() - learning_rate * actor_gradient)
+        critic_model.layers[0].set_weights(critic_model.layers[0].get_weights() - learning_rate * critic_gradient)
+
+        rmse_list.append(train_rmse)
+
+        // Check for convergence
+        if len(rmse_list) > 1 and rmse_list[-2] - rmse_list[-1] < 1e-6:
+            break
+
+    // Evaluate performance of LSTM model on test set
+    x_test = data[-sequence_length - target_length:-sequence_length]
+    y_test = data[-target_length:]
+    lstm_predictions = lstm_model.evaluate(x_test, y_test, verbose=0)
+    test_rmse = np.sqrt(lstm_predictions)
+
+    return test_rmse, rmse_list, critic_model
+}
+
+// Plot actor and critic weights
+plot(lstm_model.layers[0].get_weights()[0][0], title="Actor Weights", color=color.blue, linewidth=2)
+plot(critic_model.layers[0].get_weights()[0][0], title="Critic Weights", color=color.red, linewidth=2)
+
+// Plot rewards
+plot(rmse_list, title="RMSE", color=color.green, linewidth=2)
+
+// Define function for multi-step prediction
+multi_step_predict(lstm_model, x_test, target_length) =>
+    predicted_price = array.new_float(target_length + 1)
+    for i = 0 to target_length - 1 {
+        x_test := np.append(x_test, predicted_price[i])
+        predicted_price[i + 1] := lstm_model.predict(x_test)
+    }
+    predicted_price
+
+// Define function for scaling data
+scale_data(data, high, low) =>
+    scale_factor = high - low
+    normalized_data = (data - low) / scale_factor
+    [normalized_data, scale_factor]
+
+// Define inputs
+target_length = input(10, title="Target Length")
+sequence_length = input(50, title="Sequence Length")
+reward_scaling_factor = input(100, title="Reward Scaling Factor")
+
+// Get high and low values
+high = highest(high, sequence_length)
+low = lowest(low, sequence_length)
+
+// Scale data
+[normalized_data, scale_factor] = scale_data(close, high, low)
+
+// Train actor and critic
+train_actor_critic(lstm_model, critic_model, data, num_epochs, train_size, target_length, sequence_length, reward_scaling_factor) =>
+    // Initialize arrays
+    rewards = array.new_float(0, num_epochs * (array.size(data) - train_size - target_length))
+    critic_weights = array.new_float(0, lstm.get_trainable_variables(critic_model))
+    actor_weights = array.new_float(0, lstm.get_trainable_variables(lstm_model))
+
+    // Get high and low values
+    high = highest(high, sequence_length)
+    low = lowest(low, sequence_length)
+
+    // Scale data
+    [data, scale_factor] = scale_data(close, high, low)
+
+    k = 0
+    for i = 0 to num_epochs - 1
+        for j = train_size to array.size(data) - target_length - 1
+            // Predict next price
+            x_test = array.slice(data, j - sequence_length + 1, j)
+            predicted_price = multi_step_predict(lstm_model, x_test, target_length)
+
+            // Calculate reward
+            reward = (data[j + target_length] - predicted_price[0]) / data[j + target_length]
+            reward = reward * scale_factor / reward_scaling_factor
+
+            // Update critic
+            x_train = array.slice(data, j - sequence_length, j)
+            y_train = array.slice(array.push(predicted_price, data[j + target_length]), 0, target_length + 1)
+            lstm.train(critic_model, x_train, y_train)
+            critic_weights := lstm.get_trainable_variables(critic_model)
+
+            // Update actor
+            lstm.set_trainable_variables(lstm_model, critic_weights)
+            x_train = array.slice(data, j - sequence_length, j)
+            y_train = array.new_float(1, reward)
+            lstm.train(lstm_model, x_train, y_train)
+            actor_weights := lstm.get_trainable_variables(lstm_model)
+
+            // Store reward
+            rewards[k] := reward
+            k := k + 1
+
+    // Set final weights
+    lstm.set_trainable_variables(lstm_model, actor_weights)
+
+    rewards
+    
+// Load price data with barmerge.gaps_off parameter
+price_data = security(syminfo.tickerid, timeframe.period, close, gaps_off=true)
+
+// Create LSTM models
+lstm_model = lstm.new(num_features=1, num_units=64, num_layers=2, dropout_rate=0.2)
+critic_model = lstm.new(num_features=1, num_units=64, num_layers=2, dropout_rate=0.2)
+
+// Use a constant for the normalization scaling factor
+scaling_factor = ta.highest(price_data.high) - ta.lowest(price_data.low)
+
+// Train actor and critic
+train_actor_critic(lstm_model, critic_model, price_data, num_epochs=10, train_size=1000, target_length=1, sequence_length=50, reward_scaling_factor=0.5)
+
+// Train LSTM model
+x_train = ...
+y_train = ...
+x_test = ...
+y_test = ...
+lstm_model.train(x_train, y_train, batch_size=32, epochs=10, validation_data=(x_test, y_test), verbose=false)
+
+// Use lstm.predict() method with a batch of inputs
+predict_multi_step(model, data, steps) =>
+    predictions = array.new()
+    x_test = array.slice(data, -sequence_length)
+    lstm_predictions = model.predict(array.reshape(x_test, [1, sequence_length, 1]))
+    predicted_prices = array.slice(lstm_predictions, 0, -1, 0)
+    array.concat(predictions, predicted_prices)
+    for i = 1 to steps - 1
+        x_test = array.push(x_test, predicted_prices[-1])
+        lstm_predictions = model.predict(array.reshape(x_test, [1, sequence_length, 1]))
+        predicted_prices = array.slice(lstm_predictions, 0, -1, 0)
+        array.concat(predictions, predicted_prices)
+    return predictions
+
+
+// Use array.new() instead of array.new_float() to initialize arrays with zeros
+prepare_data() =>
+    data = array.new()
+    for i = 0 to bars - sequence_length - target_length - 1
+        sequence = array.new()
+        for j = i to i + sequence_length - 1
+            array.push(sequence, (close[j] - low[j]) / scaling_factor)
+        target = array.new()
+        for j = i + sequence_length to i + sequence_length + target_length - 1
+            array.push(target, (close[j] - low[j]) / scaling_factor)
+        array.push(data, array.concat(sequence, target))
+    return data
+    
+// Use ta.vwap() function instead of calculating VWAP manually
+vwap_data = ta.vwap(price_data)
+
+// Move multi_step_predict() function outside actor_critic_learn() for readability and reusability
+multi_step_predict(model, data, steps) =>
+    predictions = array.new()
+    x_test = array.slice(data, -sequence_length)
+    lstm_predictions = model.predict(array.reshape(x_test, [1, sequence_length, 1, 1]))
+    predicted_prices = array.slice(lstm_predictions, 0, -1, 0)
+    array.concat(predictions, predicted_prices)
+    for i = 1 to steps - 1
+        x_test = array.push(x_test, predicted_prices[-1])
+        lstm_predictions = model.predict(array.reshape(x_test, [1, sequence_length, 1, 1]))
+        predicted_prices = array.slice(lstm_predictions, 0, -1, 0)
+        array.concat(predictions, predicted_prices)
+    return predictions
+
+// Use lstm.train() method instead of lstm.train_on_batch() for training the LSTM model
+lstm_model = lstm.new(num_features, num_units, num_layers, dropout_rate)
+lstm_model.train(x_train, y_train, batch_size=32, epochs=10, validation_data=(x_test, y_test), verbose=false)
+
+// Train actor-critic model
+train_actor_critic(data, actor_model, critic_model, lstm_model, actor_learning_rate, critic_learning_rate, gamma, batch_size, num_epochs) => {
+    // Train critic model
+    for i = 0 to num_epochs - 1 {
+        critic_loss = 0.0
+        for j = 0 to (len(data) - 1) / batch_size do
+            states_batch = data[j*batch_size : (j+1)*batch_size, 0 : (data.cols - 2)]
+            actions_batch = data[j*batch_size : (j+1)*batch_size, 1]
+            rewards_batch = data[j*batch_size : (j+1)*batch_size, 2]
+            next_states_batch = data[j*batch_size : (j+1)*batch_size, 3 : data.cols - 1]
+            done_flags_batch = data[j*batch_size : (j+1)*batch_size, data.cols - 1]
+
+            critic_target = rewards_batch + gamma * critic_model.predict(next_states_batch) * (1 - done_flags_batch)
+
+            critic_predictions = critic_model.predict(states_batch)
+            critic_loss_batch = mean(pow(critic_target - critic_predictions, 2))
+            critic_loss += critic_loss_batch
+
+            critic_gradients = gradient(critic_loss_batch, critic_model.params)
+            critic_model.update(critic_gradients)
+
+        print("Epoch ", i, ", Critic Loss: ", critic_loss / len(data))
+    }
+
+    // Train actor model
+    for i = 0 to num_epochs - 1 {
+        actor_loss = 0.0
+        for j = 0 to (len(data) - 1) / batch_size do
+            states_batch = data[j*batch_size : (j+1)*batch_size, 0 : data.cols - 2]
+            actions_batch = data[j*batch_size : (j+1)*batch_size, 1]
+            rewards_batch = data[j*batch_size : (j+1)*batch_size, 2]
+            next_states_batch = data[j*batch_size : (j+1)*batch_size, 3 : data.cols - 1]
+            done_flags_batch = data[j*batch_size : (j+1)*batch_size, data.cols - 1]
+
+            critic_predictions = critic_model.predict(states_batch)
+            advantages = rewards_batch + gamma * critic_model.predict(next_states_batch) * (1 - done_flags_batch) - critic_predictions
+
+            if lstm_model is not None {
+                # If using an LSTM model, reshape the states batch to add a time dimension
+                states_batch = states_batch.reshape((states_batch.shape[0], 1, states_batch.shape[1]))
+                lstm_states = lstm_model.predict(states_batch)
+                lstm_states = (lstm_states[0], lstm_states[1])
+                actor_predictions = actor_model((states_batch, lstm_states))
+            } else {
+                actor_predictions = actor_model(states_batch)
+            }
+
+            actor_loss_batch = -mean(advantages * log(actor_predictions[range(len(actor_predictions)), actions_batch]))
+            actor_loss += actor_loss_batch
+
+            actor_gradients = gradient(actor_loss_batch, actor_model.params)
+            actor_model.update(actor_gradients)
+
+        print("Epoch ", i, ", Actor Loss: ", actor_loss / len(data))
+    }
+}
+ 
+ 
+ 
