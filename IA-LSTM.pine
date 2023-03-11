@@ -1,6 +1,19 @@
 //@version=5
 strategy("IA-LSTM", overlay=true)
 
+// Define function to normalize data
+normalize_data(_data) =>
+    normalized = ta.normalize(_data, type=ta.normtype.MINMAX)
+    normalized
+ train_test_split_ratio = 0.8
+ 
+ // Normalize the data
+normalized_sma20 = normalize_data(sma20_values)
+normalized_sma50 = normalize_data(sma50_values)
+normalized_rsi = normalize_data(rsi_values)
+normalized_macd = normalize_data(macd_values)
+normalized_cci = normalize_data(cci_values)
+
 // Define input variables
 sequence_length = input(50, minval=1, title="Sequence Length")
 target_length = input(10, minval=1, title="Target Length")
@@ -20,11 +33,6 @@ atr = ta.atr(high, low, close)
 // Preprocess data
 data = ta.normalize(ta.concat(close, volume, sma20, sma50, rsi, macd, cci, ema_fast, ema_slow))
 
-// Define function to normalize data
-normalize_data(_data) =>
-    normalized = ta.normalize(_data, type=ta.normtype.MINMAX)
-    normalized
-
 // Rename variables to make them more descriptive
 sma20_values = ta.sma(history, 20)
 sma50_values = ta.sma(history, 50)
@@ -32,12 +40,8 @@ rsi_values = ta.rsi(history, 14)
 macd_values = ta.macd(history)
 cci_values = ta.cci(history)
 
-normalized_sma20 = normalize_data(sma20_values)
-normalized_sma50 = normalize_data(sma50_values)
-normalized_rsi = normalize_data(rsi_values)
-normalized_macd = normalize_data(macd_values)
-normalized_cci = normalize_data(cci_values)
 
+// Combine the data into a multidimensional array
 data = array.join([history[:, :-1], normalized_sma20, normalized_sma50, normalized_rsi, normalized_macd, normalized_cci], axis=1)
 
 // Add target data to targets array
@@ -46,19 +50,21 @@ targets = history[sequence_length:-target_length, -1].reshape(-1, 1)
 // Allow users to label data for training
 f_label_data(_data, _label, _data_type) =>
     // Validate input
-    assert type(_label) == type.string and len(_label) <= 50, "Invalid label"
-    assert (type.isfloat(_data) or type.isstring(_data)) and array.size(_data) > 0, "Invalid data"
+    assert type.string_of(_label) and len(_label) <= 50, "Invalid label"
+    assert (type.isinteger(_data) or type.isstring(_data)) and array.size(_data) > 0, "Invalid data"
 
     // Check if label already exists
     existing_labels = array.unique(_data[:, -1])
     assert _label not in existing_labels, "Label already exists in data"
 
     // Add label to data
-    labeled_data = array.append(_data, _label, axis=1)
+    labeled_data = array.append(_data, array.new(_data_type, const(_label)), axis=1)
     labeled_data
 
 // Simplify code for calculating split index
+train_test_split_ratio = 0.8 // Define this variable before using it
 split_index = round(array.size(history) * (1 - train_test_split_ratio))
+
 
 // Reassign arrays instead of copying them
 data := history[0:sequence_length + target_length]
@@ -69,33 +75,38 @@ y_train := normalized_data[0:split_index]
 x_test := ta.normalize(history[split_index - sequence_length:-target_length], type=ta.normtype.MINMAX)
 y_test := history[split_index:-1]
 
-// Use array.zeros to create fold_errors array
-fold_errors = array.zeros(k)
+// Define variables for k-fold cross-validation
+k = 5
+fold_size = round(array.size(x_train) / k)
+fold_errors = array.new_float(k)
 
 for i = 0 to k - 1
     fold_start = i * fold_size
     fold_end = min((i + 1) * fold_size, array.size(x_train))
     
-    // Use array.slice to get fold data
-    x_fold = x_train[array.slice(fold_start, fold_end)]
-    y_fold = y_train[array.slice(fold_start, fold_end)]
-    x_fold_test = x_train[~array.slice(fold_start, fold_end)]
-    y_fold_test = y_train[~array.slice(fold_start, fold_end)]
+    // Get fold data
+    x_fold = x_train[fold_start:fold_end]
+    y_fold = y_train[fold_start:fold_end]
+    x_fold_test = x_train[fold_end:(i + 1) * fold_size]
+    y_fold_test = y_train[fold_end:(i + 1) * fold_size]
     
     // Fit the model to the training data
     lstm_model.fit(x_fold, y_fold, epochs=10, batch_size=32, verbose=0)
     
     // Evaluate the model on the test data
     fold_errors[i] := lstm_model.evaluate(x_fold_test, y_fold_test, verbose=0)
-    
-// Use list comprehension to calculate mean error
-mean_error = [sum(fold_errors) / k][0]
+
+// Calculate mean error
+mean_error = sum(fold_errors) / k
+
+// Print mean error to chart
+plot(mean_error, title="Mean Error")
 
 
 // Define function to make predictions using the LSTM model
 ml_lstm_predict(model, inputs) =>
-    predictions = model.predict(inputs)
-    return predictions
+     predictions = model.predict(inputs)
+     predictions
     
 // Define the model configuration with regularization
 input_size = sequence_length + 9
@@ -104,26 +115,34 @@ num_layers = input(2, minval=1, title="Number of Layers")
 learning_rate = input(0.001, minval=0, title="Learning Rate")
 num_epochs = input(100, minval=1, title="Number of Epochs")
 reg_strength = input(0.01, minval=0, title="Regularization Strength")
-reg_type = input("L2", options=["L1", "L2", "dropout"], title="Regularization Type")
+reg_type = input("L2", string=["L1", "L2", "dropout"], title="Regularization Type")
+
+//Variables de Entrada 
+ml_lstm_l1 = input(0.0, minval=0, maxval=1, title="LSTM L1 Regularization")
+ml_lstm_l2 = input(0.0, minval=0, maxval=1, title="LSTM L2 Regularization")
+ml_lstm_dropout = input(0.0, minval=0, maxval=1, title="LSTM Dropout")
 
 // Define the LSTM model with regularization
-model = ta.funeasy({
-    "L1": ml_lstm_l1,
-    "L2": ml_lstm_l2,
-    "dropout": ml_lstm_dropout
-}, data, input_size, hidden_size, target_length, sequence_length, num_layers=num_layers, learning_rate=learning_rate, num_epochs=num_epochs, l1_strength=ta.ternary(reg_type == "L1", reg_strength, 0), l2_strength=ta.ternary(reg_type == "L2", reg_strength, 0), dropout=ta.ternary(reg_type == "dropout", reg_strength, 0))
+ema = ta.ema(close, sequence_length)
+sma = ta.sma(close, sequence_length)
+rsi = ta.rsi(close, sequence_length)
+stdev = ta.stdev(close, sequence_length)
+inputs = ta.concat(ema, sma, rsi, stdev, hl2, hl2 - ema, hl2 - sma, hl2 - ta.wma(close, sequence_length), hl2 - ta.ema(close, sequence_length), hl2 - ta.sma(close, sequence_length))
+model = ml.lstm(inputs, 1, hidden_size, target_length, num_layers=num_layers, learning_rate=learning_rate, num_epochs=num_epochs, l1_strength=ta.ternary(reg_type == "L1", reg_strength, 0), l2_strength=ta.ternary(reg_type == "L2", reg_strength, 0), dropout=ta.ternary(reg_type == "dropout", reg_strength, 0))
 
 // Define input and target data
+data = close
 inputs = ta.sliding(data, sequence_length + 9)
 targets = close - ta.sma(close, target_length)
 
 // Use the LSTM model to make predictions
-predictions = ml_lstm_predict(model, ta.array(inputs))
+predictions = ml_lstm_predict(model, inputs)
 test_predictions = ta.sliding(predictions, target_length)
 
 // Split data into training and testing sets
 [train_data, test_data] = ta.split(data, 0.7)
 [train_target, test_target] = ta.split(targets, 0.7)
+
 
 // Implement cross-validation
 num_splits = 5
@@ -176,6 +195,7 @@ for i = 0 to max_epochs - 1 {
         }
     }
 }
+
 
 normalize_prices(symbol, scaler_type="minmax", min_val=0, max_val=1, epochs=50, lookback=50) =>
     // Verificar si el símbolo es válido
@@ -286,6 +306,12 @@ if exit_signal
 // Print the results
 print("Cross-validation scores: ", cv_scores)
 print("Test score: ", test_score)
+
+
+
+
+
+
 
 
 // Define function for actor-critic learning
@@ -548,6 +574,3 @@ train_actor_critic(data, actor_model, critic_model, lstm_model, actor_learning_r
         print("Epoch ", i, ", Actor Loss: ", actor_loss / len(data))
     }
 }
- 
- 
- 
